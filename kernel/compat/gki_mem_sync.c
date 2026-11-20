@@ -2,17 +2,17 @@
 
 #include <linux/jump_label.h>
 
-#include "compat/jailbreak.h"
+#include "compat/gki_lateload.h"
 #include "infra/symbol_resolver.h"
 #include "klog.h"
 
-DEFINE_STATIC_KEY_FALSE(ksu_rkp_key);
+DEFINE_STATIC_KEY_FALSE(ksu_gki_mem_key);
 
-void rkp_jb_init(void)
+void gki_mem_sync_init(void)
 {
     if (find_kernel_symbol_exact("rkp_started")) {
-        static_branch_enable(&ksu_rkp_key);
-        pr_info("Samsung RKP detected\n");
+        static_branch_enable(&ksu_gki_mem_key);
+        pr_info("KSU: GKI mem sync active\n");
     }
 }
 
@@ -65,26 +65,18 @@ static u32 ksu_encode_b(void *from, void *to)
     return 0x14000000u | (u32)(imm26 & 0x3FFFFFFu);
 }
 
-/* PACIASP/PACIBSP sign LR in place.  If left at fn+0 before branching to a new
+/* PACIASP/PACIBSP sign LR in place. If left at fn+0 before branching to a new
  * function that also has PACXSP, LR gets double-signed and AUTXSP at the new
  * function's epilogue fails with an FPAC fatal exception. */
 static bool ksu_insn_is_pac_signing(u32 insn)
 {
-    return insn == 0xD503233F /* PACIASP */
-           || insn == 0xD503237F; /* PACIBSP */
+    return insn == 0xD503233F || insn == 0xD503237F;
 }
 
 static bool ksu_insn_is_bti_landing_pad(u32 insn)
 {
-    switch (insn) {
-    case 0xD503241F: /* BTI    */
-    case 0xD503245F: /* BTI c  */
-    case 0xD503249F: /* BTI j  */
-    case 0xD50324DF: /* BTI jc */
-        return true;
-    default:
-        return ksu_insn_is_pac_signing(insn);
-    }
+    /* BTI variants: bits[31:8]=0xD50324, bit5=0 (op2 even), bits[4:0]=0x1F */
+    return (insn & 0xFFFFFF3F) == 0xD503241F || ksu_insn_is_pac_signing(insn);
 }
 
 static bool ksu_insn_is_pc_relative(u32 insn)
@@ -107,7 +99,7 @@ static struct ksu_branch_site *ksu_find_site(void *fn)
     return NULL;
 }
 
-int ksu_rkp_branch_patch(void *dst, void *src)
+int ksu_gki_branch_patch(void *dst, void *src)
 {
     void *current_fn, *new_fn;
     struct ksu_branch_site *site;
@@ -183,9 +175,7 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     insn_at_patch = fn0_insn;
 
     /* Advance past BTI/PAC preamble instructions (up to 2) so we don't
-     * clobber the BTI landing pad at fn+0.  Indirect calls via the syscall
-     * table use BLR; without a valid landing pad at fn+0 the CPU would raise
-     * an EL1 BTI violation. */
+     * clobber the BTI landing pad at fn+0. */
     int preamble_skip = 0;
     while (preamble_skip < 2 && ksu_insn_is_bti_landing_pad(insn_at_patch)) {
         preamble_skip++;
@@ -200,10 +190,7 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         return -EINVAL;
     }
 
-    /* PACIASP/PACIBSP at fn+0 cannot simply be left in place: it would sign LR
-     * before the branch to new_fn, and if new_fn also has PACXSP at its entry,
-     * LR gets double-signed and AUTXSP at new_fn's epilogue fails (FPAC panic).
-     * Replace fn+0 with BTI C so the BTI landing pad is preserved without signing. */
+    /* Replace fn+0 with BTI C so the BTI landing pad is preserved without signing. */
     u32 insn_at_fn0 = 0;
     if (preamble_skip > 0 && ksu_insn_is_pac_signing(fn0_insn))
         insn_at_fn0 = fn0_insn;
@@ -227,17 +214,13 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         return -ERANGE;
     }
 
-    /* Stub page is RO+X; write each word via fixmap (same path as kprobes).
-     * KCFI hash is copied from current_fn-4 so indirect callers pass the check.
-     * Stub is not yet reachable, so these writes don't need to be atomic with
-     * the live-function patch below. */
+    /* Stub page is RO+X; write each word via fixmap. */
     aarch64_insn_write((u8 *)stub + 0, *(u32 *)((u8 *)current_fn - 4));
     aarch64_insn_write((u8 *)stub + 4, stub_landing_pad);
     aarch64_insn_write((u8 *)stub + 8, insn_at_patch);
     aarch64_insn_write((u8 *)stub + 12, b_resume);
 
-    /* Commit fn+0 (BTI C, replacing PAC sign) and fn+preamble_skip (B new_fn)
-     * in a single stop_machine so no CPU ever sees a partial state. */
+    /* Commit fn+0 and fn+preamble_skip in a single stop_machine. */
     if (insn_at_fn0) {
         u32 bti_c = 0xD503245F;
         void *addrs[2] = { current_fn, patch_addr };
@@ -265,7 +248,7 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     return 0;
 }
 
-void ksu_rkp_branch_exit(void)
+void ksu_gki_branch_exit(void)
 {
     if (ksu_stub_page) {
         set_memory_nx((unsigned long)ksu_stub_page, 1);
@@ -275,7 +258,7 @@ void ksu_rkp_branch_exit(void)
     }
 }
 
-void *ksu_rkp_get_stub(void *fn)
+void *ksu_gki_get_stub(void *fn)
 {
     struct ksu_branch_site *site;
     void *result = NULL;
@@ -288,24 +271,24 @@ void *ksu_rkp_get_stub(void *fn)
     return result;
 }
 
-void rkp_jb_exit(void)
+void gki_mem_sync_exit(void)
 {
-    ksu_rkp_branch_exit();
-    static_branch_disable(&ksu_rkp_key);
+    ksu_gki_branch_exit();
+    static_branch_disable(&ksu_gki_mem_key);
 }
 
 #else /* !__aarch64__ */
 
-void rkp_jb_exit(void)
+void gki_mem_sync_exit(void)
 {
-    static_branch_disable(&ksu_rkp_key);
+    static_branch_disable(&ksu_gki_mem_key);
 }
 
-int ksu_rkp_branch_patch(void *dst, void *src)
+int ksu_gki_branch_patch(void *dst, void *src)
 {
     return -ENOSYS;
 }
-void *ksu_rkp_get_stub(void *fn)
+void *ksu_gki_get_stub(void *fn)
 {
     return NULL;
 }
